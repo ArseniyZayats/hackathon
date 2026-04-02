@@ -35,6 +35,35 @@ def parse_and_calculate_metrics(file_buffer):
         "duration": 450,       # с
     }
     return metrics
+@st.cache_data
+def get_fake_3d_plot(file_buffer):
+    t = np.linspace(0, 15, 800)
+    x = np.cos(t) * t * 4
+    y = np.sin(t) * t * 4
+    z = t * 10
+    speed = z * 1.5
+
+    fig = go.Figure(data=go.Scatter3d(
+        x=x, y=y, z=z,
+        mode='lines',
+        line = dict(
+            color = speed,
+            colorscale = 'Turbo',
+            colorbar = dict(title='Швидкість (м/с)'),
+            width = 6
+        ),
+        name='Траєкторія польоту'
+    ))
+    fig.update_layout(
+        scene=dict(
+            xaxis_title='X (Схід), м',
+            yaxis_title='Y (Північ), м',
+            zaxis_title='Z (Висота), м'
+        ),
+        margin=dict(l=0, r=0, b=0, t=0),
+        height=600
+    )
+    return fig
 
 if uploaded_file is not None:
     with st.spinner("Обробка лог-файлу..."):
