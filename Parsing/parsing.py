@@ -1,53 +1,95 @@
 """
 parser.py — Ardupilot DataFlash (.bin) log parser
+
 Extracts GPS and IMU messages into pandas DataFrames.
 
-Ardupilot DataFlash format:
+Ardupilot DataFlash binary format:
   - Each record starts with 0xA3 0x95 header bytes
   - Followed by message type byte, then payload
-  - Format definitions are stored in FMT messages
+  - Format definitions come from FMT/FMTU messages (type ids, field names, units)
+
+We rely on pymavlink to handle low-level binary decoding; our job is to
+normalize the extracted fields into consistent units and structures.
 """
 
-import struct
 import numpy as np
 import pandas as pd
 from pymavlink import mavutil
 
 
+# ---------------------------------------------------------------------------
+# Units reported by Ardupilot FMTU messages for the fields we care about.
+# pymavlink parses FMT/FMTU automatically and exposes them via msg.get_type()
+# and field access, but the numeric values are already scaled — we only need
+# to know whether a scaling step is still required.
+#
+# In practice, modern Ardupilot firmware stores:
+#   GPS.Lat / GPS.Lng  — decimal degrees  (float, NOT integer * 1e7)
+#   GPS.Alt            — meters AGL       (float)
+#   GPS.Spd            — m/s              (float)
+#   IMU.AccX/Y/Z       — m/s²            (float, body-frame, gravity included)
+#   IMU.GyrX/Y/Z       — rad/s           (float)
+#   All timestamps      — microseconds    (integer)
+# ---------------------------------------------------------------------------
+
+GPS_TYPES = ("GPS", "GPS2", "GPSB")
+IMU_TYPES = ("IMU", "IMU2")
+
+
 def parse_bin(filepath: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Parse an Ardupilot .bin DataFlash log file.
-    Returns (gps_df, imu_df) as normalized DataFrames.
+
+    Steps (matching the architecture diagram):
+      2.1 Read log with pymavlink
+      2.2 Extract GPS messages
+      2.3 Extract IMU messages
+      2.4 Normalize units
+      2.5 Return structured DataFrames
+
+    Returns:
+        gps_df  — columns: timestamp(s), lat(°), lon(°), alt(m),
+                            speed(m/s), vz(m/s), num_sats, status
+        imu_df  — columns: timestamp(s), accX/Y/Z(m/s²), gyrX/Y/Z(rad/s)
     """
+    # 2.1 — open with pymavlink; it reads FMT/FMTU definitions automatically
     log = mavutil.mavlink_connection(filepath, dialect="ardupilotmega")
 
-    gps_raw = []
-    imu_raw = []
+    gps_raw: list[dict] = []
+    imu_raw: list[dict] = []
 
     while True:
-        msg = log.recv_match(type=["GPS", "GPS2", "GPSB", "IMU", "IMU2"])
+        msg = log.recv_match(type=[*GPS_TYPES, *IMU_TYPES])
         if msg is None:
             break
 
         mtype = msg.get_type()
 
-        if mtype in ("GPS", "GPS2", "GPSB"):
+        # 2.2 — GPS extraction
+        if mtype in GPS_TYPES:
+            lat = getattr(msg, "Lat", None)
+            if lat is None:
+                continue  # skip records with no position
             entry = {
                 "timestamp": getattr(msg, "TimeUS", 0),
-                "lat": getattr(msg, "Lat", None),
+                "lat": lat,
                 "lon": getattr(msg, "Lng", getattr(msg, "Lon", None)),
                 "alt": getattr(msg, "Alt", None),
                 "speed": getattr(msg, "Spd", None),
+                "vz": getattr(msg, "VZ", None),
                 "num_sats": getattr(msg, "NSats", None),
                 "status": getattr(msg, "Status", None),
             }
-            if entry["lat"] is not None:
-                gps_raw.append(entry)
+            gps_raw.append(entry)
 
-        elif mtype in ("IMU", "IMU2"):
+        # 2.3 — IMU extraction
+        elif mtype in IMU_TYPES:
+            acc_x = getattr(msg, "AccX", None)
+            if acc_x is None:
+                continue  # skip records missing sensor data
             entry = {
                 "timestamp": getattr(msg, "TimeUS", 0),
-                "accX": getattr(msg, "AccX", None),
+                "accX": acc_x,
                 "accY": getattr(msg, "AccY", None),
                 "accZ": getattr(msg, "AccZ", None),
                 "gyrX": getattr(msg, "GyrX", None),
@@ -62,25 +104,37 @@ def parse_bin(filepath: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             "File may be corrupted or not an Ardupilot DataFlash log."
         )
 
+    # 2.4 + 2.5 — normalize and wrap in DataFrames
     gps_df = _normalize_gps(pd.DataFrame(gps_raw)) if gps_raw else pd.DataFrame()
     imu_df = _normalize_imu(pd.DataFrame(imu_raw)) if imu_raw else pd.DataFrame()
 
     return gps_df, imu_df
 
 
-def _normalize_gps(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert raw GPS fields to standard units."""
-    df = df.copy()
-    # TimeUS → seconds
-    df["timestamp"] = df["timestamp"] / 1e6
+# ---------------------------------------------------------------------------
+# 2.4  Unit normalization
+# ---------------------------------------------------------------------------
 
-    # Ardupilot stores lat/lon as integer degrees * 1e7
-    if df["lat"].abs().max() > 1000:
+def _normalize_gps(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert raw GPS fields to standard units.
+
+    Modern Ardupilot firmware already outputs GPS.Lat/Lng as decimal degrees
+    and Alt in metres. Older builds stored lat/lon as integer * 1e7 and alt
+    in centimetres; we detect these cases heuristically only as a safety net.
+    """
+    df = df.copy()
+
+    # TimeUS (µs) → seconds
+    df["timestamp"] = df["timestamp"] / 1_000_000.0
+
+    # Lat/Lon: if stored as integer * 1e7 the value exceeds ±360 substantially
+    if df["lat"].abs().max() > 900:          # 900° is impossible in real degrees
         df["lat"] = df["lat"] / 1e7
         df["lon"] = df["lon"] / 1e7
 
-    # Alt in cm → meters (some firmware versions)
-    if df["alt"].abs().max() > 10_000:
+    # Altitude: if stored in cm the value for typical flights exceeds 10 000
+    if df["alt"].notna().any() and df["alt"].abs().max() > 10_000:
         df["alt"] = df["alt"] / 100.0
 
     df = df.dropna(subset=["lat", "lon"])
@@ -89,24 +143,38 @@ def _normalize_gps(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _normalize_imu(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert raw IMU fields to standard units."""
+    """
+    Convert raw IMU fields to standard units.
+
+    pymavlink already returns AccX/Y/Z in m/s² and GyrX/Y/Z in rad/s,
+    so we only need to convert the timestamp.
+    """
     df = df.copy()
-    df["timestamp"] = df["timestamp"] / 1e6
+    df["timestamp"] = df["timestamp"] / 1_000_000.0
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
 
+# ---------------------------------------------------------------------------
+# Sampling frequency utility
+# ---------------------------------------------------------------------------
+
 def sampling_frequencies(gps_df: pd.DataFrame, imu_df: pd.DataFrame) -> dict:
-    """Calculate approximate sensor sampling frequencies (Hz)."""
-    result = {}
+    """Return approximate sampling frequencies (Hz) for each sensor."""
+    result: dict = {}
+
     if not gps_df.empty:
-        gps_dt = gps_df["timestamp"].diff().median()
-        result["gps_hz"] = round(1.0 / gps_dt, 2) if gps_dt > 0 else 0
+        dt = gps_df["timestamp"].diff().median()
+        result["gps_hz"] = round(1.0 / dt, 2) if dt and dt > 0 else 0
         result["gps_count"] = len(gps_df)
+
     if not imu_df.empty:
-        imu_dt = imu_df["timestamp"].diff().median()
-        result["imu_hz"] = round(1.0 / imu_dt, 2) if imu_dt > 0 else 0
+        # Use mean of non-zero diffs to handle paired IMU/IMU2 entries
+        diffs = imu_df["timestamp"].diff()
+        dt = diffs[diffs > 0].mean()
+        result["imu_hz"] = round(1.0 / dt, 2) if dt and dt > 0 else 0
         result["imu_count"] = len(imu_df)
+
     return result
 
 
@@ -137,19 +205,19 @@ def generate_synthetic_flight(
     lat = lat0 + radius_deg * np.sin(phase) * (t_gps / duration_s)
     lon = lon0 + radius_deg * np.cos(phase) * (t_gps / duration_s)
 
-    # Altitude: takeoff 0→50m, cruise 50m, descent 50→0m
+    # Altitude: takeoff 0→50 m, cruise 50 m, descent 50→0 m
+    q = n_gps // 4
     alt_profile = np.concatenate([
-        np.linspace(0, 50, n_gps // 4),
+        np.linspace(0, 50, q),
         np.full(n_gps // 2, 50) + rng.normal(0, 0.5, n_gps // 2),
-        np.linspace(50, 0, n_gps - 3 * (n_gps // 4)),
+        np.linspace(50, 0, n_gps - 3 * q),
     ])
-    alt = alt_profile[:n_gps] + rng.normal(0, 0.2, n_gps)
-    alt = np.clip(alt, 0, None)
+    alt = (alt_profile[:n_gps] + rng.normal(0, 0.2, n_gps)).clip(0)
 
-    # Horizontal speed from differentiation
     dx = np.gradient(lon, t_gps) * 111_320 * np.cos(np.radians(lat0))
     dy = np.gradient(lat, t_gps) * 110_540
-    speed = np.sqrt(dx**2 + dy**2)
+    speed = np.hypot(dx, dy)
+    vz = np.gradient(alt, t_gps)
 
     gps_df = pd.DataFrame({
         "timestamp": t_gps,
@@ -157,6 +225,7 @@ def generate_synthetic_flight(
         "lon": lon,
         "alt": alt,
         "speed": speed,
+        "vz": vz,
         "num_sats": rng.integers(8, 14, n_gps),
         "status": 3,
     })
@@ -164,23 +233,19 @@ def generate_synthetic_flight(
     # ----- IMU track -----
     n_imu = int(duration_s * imu_hz)
     t_imu = np.linspace(0, duration_s, n_imu)
+    q_imu = n_imu // 4
 
-    # Gravity ~9.81 on Z, motion on X/Y
-    accX = rng.normal(0.0, 0.3, n_imu)
-    accY = rng.normal(0.0, 0.3, n_imu)
-    # Vertical: lift during takeoff, descent, hover around 0 in cruise
     vert_profile = np.concatenate([
-        np.linspace(0.5, 0.0, n_imu // 4),   # takeoff thrust
+        np.linspace(0.5, 0.0, q_imu),
         np.zeros(n_imu // 2),
-        np.linspace(0.0, -0.5, n_imu - 3 * (n_imu // 4)),  # descent
+        np.linspace(0.0, -0.5, n_imu - 3 * q_imu),
     ])
-    accZ = vert_profile[:n_imu] + rng.normal(0, 0.1, n_imu) - 9.81
 
     imu_df = pd.DataFrame({
         "timestamp": t_imu,
-        "accX": accX,
-        "accY": accY,
-        "accZ": accZ,
+        "accX": rng.normal(0.0, 0.3, n_imu),
+        "accY": rng.normal(0.0, 0.3, n_imu),
+        "accZ": vert_profile[:n_imu] + rng.normal(0, 0.1, n_imu) - 9.81,
         "gyrX": rng.normal(0, 0.05, n_imu),
         "gyrY": rng.normal(0, 0.05, n_imu),
         "gyrZ": rng.normal(0, 0.02, n_imu),
