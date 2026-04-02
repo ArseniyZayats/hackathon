@@ -68,8 +68,11 @@ def get_fake_3d_plot(file_buffer):
 if uploaded_file is not None:
     with st.spinner("Обробка лог-файлу..."):
         metrics = parse_and_calculate_metrics(uploaded_file)
+        fig = get_fake_3d_plot(uploaded_file)
+
     st.subheader("Основні метрики")
     col1, col2, col3, col4, col5 = st.columns(5)
+
     with col1:
         st.metric("Макс. горизонтальна швидкість", value=f"{metrics['max_h_speed']} м/с")
     with col2:
