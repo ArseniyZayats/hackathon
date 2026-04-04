@@ -6,7 +6,7 @@ and generates an interactive, animated 3D HTML dashboard.
 
 Workflow:
 1. Dynamically finds all .BIN files in the target directory using glob.
-2. Uses the team's parser (parse_bin) to extract MAVLink data.
+2. Uses the custom parser (parse_bin) to extract MAVLink data.
 3. Merges asynchronous sensor data (e.g., 5Hz GPS with 50Hz IMU) using time-based proximity.
 4. Converts spherical coordinates (Lat/Lon/Alt) to local Cartesian (East/North/Up).
 5. Generates an interactive Plotly 3D scene with synchronized multi-flight animation.
@@ -23,17 +23,17 @@ import os
 import glob
 
 # =============================================================================
-# MODULE 1: PROJECT ENVIRONMENT & TEAM DEPENDENCIES
+# MODULE 1: PROJECT ENVIRONMENT & DEPENDENCIES
 # =============================================================================
 # Dynamically add the parent directory to sys.path so the script can locate 
-# the team's custom modules ('parser' and 'coreAnalytics') from any working directory.
+# custom modules ('parser' and 'coreAnalytics') from any working directory.
 current_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir = os.path.dirname(current_dir)
 
 if base_dir not in sys.path:
     sys.path.insert(0, base_dir)
 
-# Import the team's custom binary parser and data preparation tools
+# Import custom binary parser and data preparation tools
 try:
     from parser import parse_bin
 except ModuleNotFoundError:
@@ -92,6 +92,10 @@ def geodetic2enu_custom(lat, lon, alt, lat0, lon0, alt0):
 bin_files_path = os.path.join(base_dir, "*.BIN")
 files_to_process = [os.path.basename(f) for f in glob.glob(bin_files_path)]
 
+if not files_to_process:
+    print(f"ERROR: No .BIN files found in {base_dir}")
+    sys.exit()
+
 processed_flights = []
 global_speeds = []
 max_flight_duration = 0
@@ -99,51 +103,80 @@ max_flight_duration = 0
 for bin_file_name in files_to_process:
     bin_file_path = os.path.join(base_dir, bin_file_name)
     
-    # Extract raw dataframes using the team's parser
-    parsed_data = parse_bin(bin_file_path)
-    
-    if isinstance(parsed_data, tuple) and len(parsed_data) == 5:
-        gps_df, imu_df, att_df, mode_df, curr_df = parsed_data
-    else:
-        gps_df, imu_df = parsed_data[:2]
-        att_df = mode_df = curr_df = pd.DataFrame()
-
-    # Time-based asynchronous merging (merge_asof) matches high-frequency IMU 
-    # data to low-frequency GPS data based on the closest timestamp.
-    real_df = merge_data(gps_df, imu_df)
-    for extra_df in [att_df, mode_df, curr_df]:
-        if not extra_df.empty:
-            extra_df = extra_df.rename(columns={"timestamp": "time_s"})
-            real_df = pd.merge_asof(real_df.sort_values("time_s"), 
-                                    extra_df.sort_values("time_s"), 
-                                    on="time_s", direction="nearest")
+    try:
+        # Extract raw dataframes using the parser
+        parsed_data = parse_bin(bin_file_path)
+        
+        if not parsed_data or not isinstance(parsed_data, tuple):
+            print(f"WARNING: Skipping {bin_file_name} - Corrupted format.")
+            continue
             
-    validate_columns(real_df)
-    df = prepare_data(real_df)
-    
-    # Calculate derived telemetry features
-    # 1. Vertical Speed (Climb rate)
-    df['v_speed'] = df['alt_m'].diff() / df['time_s'].diff().replace(0, np.nan)
-    df['v_speed'] = df['v_speed'].fillna(0.0)
+        if len(parsed_data) == 5:
+            gps_df, imu_df, att_df, mode_df, curr_df = parsed_data
+        else:
+            gps_df, imu_df = parsed_data[:2]
+            att_df = mode_df = curr_df = pd.DataFrame()
 
-    # 2. ENU Cartesian Coordinates (Setting first point as Home [0,0,0])
-    lat0, lon0, alt0 = df['lat_deg'].iloc[0], df['lon_deg'].iloc[0], df['alt_m'].iloc[0]
-    df['E'], df['N'], df['U'] = geodetic2enu_custom(df['lat_deg'], df['lon_deg'], df['alt_m'], lat0, lon0, alt0)
-    
-    # 3. Mission Range (Euclidean distance from Home point)
-    df['range'] = np.sqrt(df['E']**2 + df['N']**2 + df['U']**2)
-    
-    # 4. Relative Time (Crucial for multi-flight animation synchronization)
-    df['t_rel'] = df['time_s'] - df['time_s'].iloc[0]
-    duration = df['t_rel'].iloc[-1]
-    if duration > max_flight_duration:
-        max_flight_duration = duration
-    
-    global_speeds.extend(df['gps_speed'].tolist())
-    processed_flights.append({"name": bin_file_name, "df": df, "alt_ref": alt0})
+        if gps_df.empty or imu_df.empty:
+            print(f"WARNING: Skipping {bin_file_name} - No GPS or IMU data found.")
+            continue
+
+        # Time-based asynchronous merging (merge_asof) matches high-frequency IMU 
+        # data to low-frequency GPS data based on the closest timestamp.
+        real_df = merge_data(gps_df, imu_df)
+        for extra_df in [att_df, mode_df, curr_df]:
+            if not extra_df.empty:
+                extra_df = extra_df.rename(columns={"timestamp": "time_s"})
+                real_df = pd.merge_asof(real_df.sort_values("time_s"), 
+                                        extra_df.sort_values("time_s"), 
+                                        on="time_s", direction="nearest")
+                
+        validate_columns(real_df)
+        df = prepare_data(real_df)
+        
+        required_cols = ['lat_deg', 'lon_deg', 'alt_m', 'time_s']
+        if df.empty or not all(col in df.columns for col in required_cols):
+            print(f"WARNING: Skipping {bin_file_name} - Missing core GPS data!")
+            continue
+            
+        if 'gps_speed' not in df.columns:
+            df['gps_speed'] = 0.0
+
+        # Calculate derived telemetry features
+        # 1. Vertical Speed (Climb rate)
+        if 'v_speed' not in df.columns:
+            df['v_speed'] = df['alt_m'].diff() / df['time_s'].diff().replace(0, np.nan)
+            df['v_speed'] = df['v_speed'].fillna(0.0)
+
+        # 2. ENU Cartesian Coordinates (Setting first point as Home [0,0,0])
+        lat0, lon0, alt0 = df['lat_deg'].iloc[0], df['lon_deg'].iloc[0], df['alt_m'].iloc[0]
+        df['E'], df['N'], df['U'] = geodetic2enu_custom(df['lat_deg'], df['lon_deg'], df['alt_m'], lat0, lon0, alt0)
+        
+        # 3. Mission Range (Euclidean distance from Home point)
+        df['range'] = np.sqrt(df['E']**2 + df['N']**2 + df['U']**2)
+        
+        # 4. Relative Time (Crucial for multi-flight animation synchronization)
+        df['t_rel'] = df['time_s'] - df['time_s'].iloc[0]
+        duration = df['t_rel'].iloc[-1]
+        if duration > max_flight_duration:
+            max_flight_duration = duration
+        
+        global_speeds.extend(df['gps_speed'].tolist())
+        processed_flights.append({"name": bin_file_name, "df": df, "alt_ref": alt0})
+
+    except Exception as e:
+        print(f"ERROR processing {bin_file_name}: {e}")
+        continue
+
+if not global_speeds:
+    print("ERROR: No GPS speed data could be extracted from any files.")
+    sys.exit()
 
 # Establish global speed bounds for a unified color scale across all flights
 min_s, max_s = min(global_speeds), max(global_speeds)
+
+if min_s == max_s:
+    max_s += 0.1
 
 # =============================================================================
 # MODULE 4: 3D VISUALIZATION ENGINE (STATIC BASE)
@@ -179,9 +212,9 @@ for idx, flight in enumerate(processed_flights):
         pwr_txt = f"{pwr_val:.1f}V | {row.get('curr', 0):.1f}A" if pwr_val > 1.0 else "No Power Data"
         
         txt = (f"<b>ID: {short_id} [{row.get('mode_name', 'N/A')}]</b><br>"
-               f"Time: {row['time_s'] - t_0:.1f}s | {sat_txt}<br>"
-               f"Speed: {row['gps_speed']:.1f} m/s | Climb: {row['v_speed']:+.1f} m/s<br>"
-               f"Altitude: {row['alt_m']:.1f} m<br>"
+               f"Time: {row.get('time_s', t_0) - t_0:.1f}s | {sat_txt}<br>"
+               f"Speed: {row.get('gps_speed', 0.0):.1f} m/s | Climb: {row.get('v_speed', 0.0):+.1f} m/s<br>"
+               f"Altitude: {row.get('alt_m', 0.0):.1f} m<br>"
                f"Attitude: R:{row.get('roll',0):.1f} P:{row.get('pitch',0):.1f} Y:{row.get('yaw',0):.1f} deg<br>"
                f"Power: {pwr_txt}")
         hover_texts.append(txt)
