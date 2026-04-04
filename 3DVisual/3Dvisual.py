@@ -395,7 +395,7 @@ def generate_3d_model(target_folder=None):
         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
     )
 
-    # CRITICAL FOR WEB INTEGRATION: Return BOTH fig objects
+    #  WEB INTEGRATION: Return BOTH fig objects
     return fig, fig_map
 
 
