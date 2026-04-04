@@ -90,7 +90,8 @@ def geodetic2enu_custom(lat, lon, alt, lat0, lon0, alt0):
 # =============================================================================
 def generate_3d_model(target_folder=None):
     """
-    Main function to generate the 3D model. Returns a Plotly figure object (fig).
+    Main function to generate the 3D model. Returns a tuple of Plotly figure objects:
+    (fig_3d, fig_map)
     """
     # If no target folder is provided, default to base_dir
     if target_folder is None:
@@ -358,22 +359,66 @@ def generate_3d_model(target_folder=None):
         )]
     )
 
- 
-    return fig
+    # =============================================================================
+    # MODULE 6: 2D MAP VISUALIZATION (fig_map)
+    # =============================================================================
+    fig_map = go.Figure()
+    
+    for flight in processed_flights:
+        df = flight["df"]
+        short_id = flight['name'].replace('.BIN', '')[-2:]
+        
+        fig_map.add_trace(go.Scattermapbox(
+            lat=df['lat_deg'],
+            lon=df['lon_deg'],
+            mode='lines+markers',
+            name=f"Flight {short_id}",
+            marker=dict(size=4, color=df['gps_speed'], colorscale='Turbo', cmin=min_s, cmax=max_s),
+            line=dict(width=2),
+            hoverinfo="text",
+            text=[f"UAV-{short_id} | Spd: {spd:.1f} m/s | Alt: {alt:.1f} m" for spd, alt in zip(df['gps_speed'], df['alt_m'])]
+        ))
+
+    # Calculate center for the map view
+    all_lats = np.concatenate([f["df"]['lat_deg'].values for f in processed_flights])
+    all_lons = np.concatenate([f["df"]['lon_deg'].values for f in processed_flights])
+    
+    fig_map.update_layout(
+        mapbox=dict(
+            style="carto-darkmatter", # Dark theme map without requiring an API token
+            center=dict(lat=np.mean(all_lats), lon=np.mean(all_lons)),
+            zoom=16
+        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+        template="plotly_dark",
+        showlegend=True,
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+    )
+
+    # CRITICAL FOR WEB INTEGRATION: Return BOTH fig objects
+    return fig, fig_map
 
 
 # =============================================================================
 # LOCAL TESTING BLOCK
 # =============================================================================
 if __name__ == "__main__":
-    print("Generating 3D Analytics Model...")
+    print("Generating Analytics Models...")
     # Call the generation function
-    final_fig = generate_3d_model()
+    result = generate_3d_model()
     
-    if final_fig is not None:
-        output_file = os.path.join(current_dir, "ultimate_analytics.html")
-        # Save the file as usual for local viewing
-        final_fig.write_html(output_file, auto_open=True, auto_play=False) 
-        print(f"Mission Successful! Analytics saved to: {output_file}")
+    if result is not None:
+        final_fig_3d, final_fig_map = result
+        
+        # Save 3D model
+        output_file_3d = os.path.join(current_dir, "ultimate_analytics_3d.html")
+        final_fig_3d.write_html(output_file_3d, auto_open=True, auto_play=False) 
+        
+        # Save 2D Map model
+        output_file_map = os.path.join(current_dir, "ultimate_analytics_map.html")
+        final_fig_map.write_html(output_file_map, auto_open=True) 
+        
+        print(f"Mission Successful! 3D Analytics saved to: {output_file_3d}")
+        print(f"Mission Successful! 2D Map saved to: {output_file_map}")
     else:
         print("Generation failed due to missing or corrupted data.")
