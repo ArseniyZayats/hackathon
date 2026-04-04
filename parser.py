@@ -32,62 +32,80 @@ from pymavlink import mavutil
 #   All timestamps      — microseconds    (integer)
 # ---------------------------------------------------------------------------
 
-GPS_TYPES = ("GPS", "GPS2", "GPSB")
-IMU_TYPES = ("IMU", "IMU2")
+GPS_TYPES  = ("GPS", "GPS2", "GPSB")
+IMU_TYPES  = ("IMU", "IMU2")
+ATT_TYPES  = ("ATT",)
+MODE_TYPES = ("MODE",)
+CURR_TYPES = ("CURR", "BAT", "CURR2")
+
+# Ardupilot flight mode ID → human-readable name.
+# Covers both ArduCopter and ArduPlane (overlapping IDs get copter priority).
+ARDUPILOT_MODES: dict[int, str] = {
+    # ArduCopter
+    0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO",
+    4: "GUIDED", 5: "LOITER", 6: "RTL", 7: "CIRCLE",
+    9: "LAND", 11: "DRIFT", 13: "SPORT", 14: "FLIP",
+    15: "AUTOTUNE", 16: "POSHOLD", 17: "BRAKE", 18: "THROW",
+    19: "AVOID_ADSB", 20: "GUIDED_NOGPS", 21: "SMART_RTL",
+    22: "FLOWHOLD", 23: "FOLLOW", 24: "ZIGZAG", 25: "SYSTEMID",
+    26: "HELI_AUTOROTATE", 27: "AUTO_RTL",
+    # ArduPlane extras (where id doesn't clash with copter above)
+    8: "AUTOTUNE_FW", 10: "AUTO_FW", 12: "LOITER_FW",
+    17: "QSTABILIZE", 18: "QHOVER", 19: "QLOITER",
+    20: "QLAND", 21: "QRTL", 22: "QAUTOTUNE",
+    23: "QACRO", 24: "THERMAL",
+}
 
 
-def parse_bin(filepath: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def parse_bin(filepath: str) -> tuple[
+    pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame
+]:
     """
     Parse an Ardupilot .bin DataFlash log file.
 
-    Steps (matching the architecture diagram):
-      2.1 Read log with pymavlink
-      2.2 Extract GPS messages
-      2.3 Extract IMU messages
-      2.4 Normalize units
-      2.5 Return structured DataFrames
-
     Returns:
-        gps_df  — columns: timestamp(s), lat(°), lon(°), alt(m),
-                            speed(m/s), vz(m/s), num_sats, status
-        imu_df  — columns: timestamp(s), accX/Y/Z(m/s²), gyrX/Y/Z(rad/s)
+        gps_df  — timestamp(s), lat(°), lon(°), alt(m), speed(m/s), vz(m/s), num_sats, status
+        imu_df  — timestamp(s), accX/Y/Z(m/s²), gyrX/Y/Z(rad/s)
+        att_df  — timestamp(s), roll(°), pitch(°), yaw(°)
+        mode_df — timestamp(s), mode_id, mode_name
+        curr_df — timestamp(s), voltage(V), current(A), consumed(mAh)
     """
-    # 2.1 — open with pymavlink; it reads FMT/FMTU definitions automatically
+    all_types = [*GPS_TYPES, *IMU_TYPES, *ATT_TYPES, *MODE_TYPES, *CURR_TYPES]
     log = mavutil.mavlink_connection(filepath, dialect="ardupilotmega")
 
-    gps_raw: list[dict] = []
-    imu_raw: list[dict] = []
+    gps_raw:  list[dict] = []
+    imu_raw:  list[dict] = []
+    att_raw:  list[dict] = []
+    mode_raw: list[dict] = []
+    curr_raw: list[dict] = []
 
     while True:
-        msg = log.recv_match(type=[*GPS_TYPES, *IMU_TYPES])
+        msg = log.recv_match(type=all_types)
         if msg is None:
             break
 
         mtype = msg.get_type()
 
-        # 2.2 — GPS extraction
         if mtype in GPS_TYPES:
             lat = getattr(msg, "Lat", None)
             if lat is None:
-                continue  # skip records with no position
-            entry = {
+                continue
+            gps_raw.append({
                 "timestamp": getattr(msg, "TimeUS", 0),
-                "lat": lat,
-                "lon": getattr(msg, "Lng", getattr(msg, "Lon", None)),
-                "alt": getattr(msg, "Alt", None),
-                "speed": getattr(msg, "Spd", None),
-                "vz": getattr(msg, "VZ", None),
-                "num_sats": getattr(msg, "NSats", None),
-                "status": getattr(msg, "Status", None),
-            }
-            gps_raw.append(entry)
+                "lat":       lat,
+                "lon":       getattr(msg, "Lng", getattr(msg, "Lon", None)),
+                "alt":       getattr(msg, "Alt", None),
+                "speed":     getattr(msg, "Spd", None),
+                "vz":        getattr(msg, "VZ", None),
+                "num_sats":  getattr(msg, "NSats", None),
+                "status":    getattr(msg, "Status", None),
+            })
 
-        # 2.3 — IMU extraction
         elif mtype in IMU_TYPES:
             acc_x = getattr(msg, "AccX", None)
             if acc_x is None:
-                continue  # skip records missing sensor data
-            entry = {
+                continue
+            imu_raw.append({
                 "timestamp": getattr(msg, "TimeUS", 0),
                 "accX": acc_x,
                 "accY": getattr(msg, "AccY", None),
@@ -95,8 +113,34 @@ def parse_bin(filepath: str) -> tuple[pd.DataFrame, pd.DataFrame]:
                 "gyrX": getattr(msg, "GyrX", None),
                 "gyrY": getattr(msg, "GyrY", None),
                 "gyrZ": getattr(msg, "GyrZ", None),
-            }
-            imu_raw.append(entry)
+            })
+
+        elif mtype in ATT_TYPES:
+            att_raw.append({
+                "timestamp": getattr(msg, "TimeUS", 0),
+                "roll":      getattr(msg, "Roll",  None),
+                "pitch":     getattr(msg, "Pitch", None),
+                "yaw":       getattr(msg, "Yaw",   None),
+            })
+
+        elif mtype in MODE_TYPES:
+            mode_id = getattr(msg, "Mode", None)
+            mode_raw.append({
+                "timestamp": getattr(msg, "TimeUS", 0),
+                "mode_id":   mode_id,
+                "mode_name": ARDUPILOT_MODES.get(mode_id, f"MODE_{mode_id}"),
+            })
+
+        elif mtype in CURR_TYPES:
+            volt = getattr(msg, "Volt", getattr(msg, "Voltage", None))
+            if volt is None:
+                continue
+            curr_raw.append({
+                "timestamp": getattr(msg, "TimeUS", 0),
+                "voltage":   volt,
+                "current":   getattr(msg, "Curr", getattr(msg, "Current", None)),
+                "consumed":  getattr(msg, "CurrTot", getattr(msg, "Consumed", None)),
+            })
 
     if not gps_raw and not imu_raw:
         raise ValueError(
@@ -104,11 +148,18 @@ def parse_bin(filepath: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             "File may be corrupted or not an Ardupilot DataFlash log."
         )
 
-    # 2.4 + 2.5 — normalize and wrap in DataFrames
-    gps_df = _normalize_gps(pd.DataFrame(gps_raw)) if gps_raw else pd.DataFrame()
-    imu_df = _normalize_imu(pd.DataFrame(imu_raw)) if imu_raw else pd.DataFrame()
+    gps_df  = _normalize_gps(pd.DataFrame(gps_raw))   if gps_raw  else pd.DataFrame()
+    imu_df  = _normalize_imu(pd.DataFrame(imu_raw))   if imu_raw  else pd.DataFrame()
+    att_df  = _normalize_ts(pd.DataFrame(att_raw))    if att_raw  else pd.DataFrame()
+    mode_df = _normalize_ts(pd.DataFrame(mode_raw))   if mode_raw else pd.DataFrame()
+    curr_df = _normalize_ts(pd.DataFrame(curr_raw))   if curr_raw else pd.DataFrame()
 
-    return gps_df, imu_df
+    return gps_df, imu_df, att_df, mode_df, curr_df
+
+
+# ---------------------------------------------------------------------------
+# Synthetic data generator — used for demo when no real .bin file is provided
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +209,14 @@ def _normalize_imu(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _normalize_ts(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert TimeUS (µs) → seconds for ATT, MODE, CURR DataFrames."""
+    df = df.copy()
+    df["timestamp"] = df["timestamp"] / 1_000_000.0
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Sampling frequency utility
 # ---------------------------------------------------------------------------
@@ -189,7 +248,7 @@ def generate_synthetic_flight(
     duration_s: float = 120.0,
     gps_hz: float = 5.0,
     imu_hz: float = 50.0,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Generate a realistic synthetic UAV flight dataset for demonstration.
     Flight profile: takeoff → cruise → descent → landing.
@@ -254,4 +313,30 @@ def generate_synthetic_flight(
         "gyrZ": rng.normal(0, 0.02, n_imu),
     })
 
-    return gps_df, imu_df
+    # ----- ATT (attitude) -----
+    att_df = pd.DataFrame({
+        "timestamp": t_gps,
+        "roll":  rng.normal(0, 5, n_gps),
+        "pitch": rng.normal(0, 3, n_gps),
+        "yaw":   np.degrees(phase) % 360,
+    })
+
+    # ----- MODE (flight modes) -----
+    mode_ids = [0, 3, 5, 6]
+    mode_df = pd.DataFrame({
+        "timestamp": [0.0, duration_s * 0.1, duration_s * 0.2, duration_s * 0.85],
+        "mode_id":   mode_ids,
+        "mode_name": [ARDUPILOT_MODES.get(m, f"MODE_{m}") for m in mode_ids],
+    })
+
+    # ----- CURR (battery) -----
+    n_curr = int(duration_s * 2)
+    t_curr = np.linspace(0, duration_s, n_curr)
+    curr_df = pd.DataFrame({
+        "timestamp": t_curr,
+        "voltage":   np.linspace(16.8, 14.2, n_curr) + rng.normal(0, 0.05, n_curr),
+        "current":   np.abs(rng.normal(12, 2, n_curr)),
+        "consumed":  np.linspace(0, 1800, n_curr),
+    })
+
+    return gps_df, imu_df, att_df, mode_df, curr_df
