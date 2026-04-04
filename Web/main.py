@@ -2,7 +2,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import google.generativeai as genai
 import time
+
+GEMINI_API_KEY = "AIzaSyDhiXEiJjZ0gvXnmMn_yDbtCrV0U8z62bQ"
 
 st.set_page_config(
     page_title = "UAV Telemetry Analyzer",
@@ -65,11 +68,36 @@ def get_fake_3d_plot(file_buffer):
     )
     return fig
 
+@st.cache_data
+def get_fake_map_plot(file_buffer):   
+    start_lat, start_lon = 49.8353, 24.0145
+
+    t = np.linspace(0, 2*np.pi, 200)
+    lats = start_lat + np.sin(t) * 0.002
+    lons = start_lon + np.cos(t) * 0.003
+
+    fig = go.Figure(data=go.Scattermapbox(
+        lat=lats,
+        lon=lons,
+        mode='lines',
+        line=dict(width=4, color='red'),
+        name='Маршрут'
+    ))
+    fig.update_layout(
+        mapbox_style="open-street-map",
+        mapbox = dict(
+            center = dict(lat = start_lat, lon = start_lon),
+                    zoom = 14.5
+        ),
+        margin=dict(l=0, r=0, b=0, t=0),
+        height=500
+    )
+    return fig
+
 if uploaded_file is not None:
     with st.spinner("Обробка лог-файлу..."):
         metrics = parse_and_calculate_metrics(uploaded_file)
-        fig = get_fake_3d_plot(uploaded_file)
-
+        
     st.subheader("Основні метрики")
     col1, col2, col3, col4, col5 = st.columns(5)
 
@@ -89,21 +117,65 @@ if uploaded_file is not None:
     st.divider()
 
     st.subheader("Траєкторія польоту")
-    if uploaded_file is not None:
-        with st.spinner("Візуалізація траєкторії..."):
-            time.sleep(2) # Імітація часу візуалізації
-            # Функція Ангеліни, що повертатиме fig, в якому зашита вся магія
-            st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("Будь ласка, завантажте лог-файл для візуалізації траєкторії.")
-    st.divider()
-
-    st.subheader("AI асистент")
-    if st.button("Згенерувати текстовий висновок про політ"):
-        with st.spinner("Генерація висновку..."):
-            st.success("Політ був стабільним з невеликими коливаннями висоти. Максимальна швидкість була досягнута під час маневрування.")
 else:
     st.warning("Будь ласка, завантажте лог-файл для аналізу.")
+
+if uploaded_file is not None:
+    with st.spinner("Візуалізація траєкторії та створення мапи..."):
+        fig_map = get_fake_map_plot(uploaded_file)
+        fig = get_fake_3d_plot(uploaded_file)
+
+        time.sleep(2) # Імітація часу візуалізації
+        tab1, tab2 = st.tabs(["🧊 3D Аналіз", "🗺️ Карта маршруту"])
+        with tab1:
+            st.markdown("**Детальна 3D-модель з колоруванням за швидкістю**")
+            # Функція Ангеліни, що повертатиме fig, в якому зашита вся магія
+            st.plotly_chart(fig, use_container_width=True)
+        with tab2:
+            st.markdown("**Інтерактивна карта з маршрутом польоту**")
+            st.plotly_chart(fig_map, use_container_width=True) 
+else:
+    st.warning("Будь ласка, завантажте лог-файл для візуалізації траєкторії.")
+
+st.divider()
+
+st.subheader("🤖 AI-Асистент")
+st.write("Автоматичний аналіз показників польоту за допомогою LLM.")
+
+if "ai_response" not in st.session_state:
+        st.session_state.ai_response = None
+
+if st.button("Згенерувати текстовий висновок про політ", type="primary"):
+    with st.spinner("Генерація висновку..."):
+        try:
+            genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+
+            model = genai.GenerativeModel("gemini-2.5-flash")
+
+            prompt = f"""
+            Ти - інженер-аналітик телеметрії БПЛА. Твоє завдання: проаналізувати базові показники місії та написати короткий технічний висновок (до 3-4 речень) українською мовою.
+                Зверни увагу на можливі аномалії. Якщо показники в нормі, підтвердь це.
+            Ось показники місії:
+            - Максимальна горизонтальна швидкість: {metrics['max_h_speed']} м/с
+            - Максимальна вертикальна швидкість: {metrics['max_v_speed']} м/с
+            - Максимальне прискорення: {metrics['max_accel']} м/с
+            - Максимальна висота: {metrics['max_alt']} м
+            - Тривалість польоту: {metrics['duration']} секунд
+
+            напиши висновок:
+            """
+
+            response = model.generate_content(prompt)
+            if response.text:
+                st.session_state.ai_response = response.text
+            else:
+                st.session_state.ai_response = "⚠️ Модель повернула порожню відповідь. Спробуйте ще раз."
+            st.info("Висновок згенеровано успішно!")
+        except Exception as e:
+            st.error(f"⚠️ Помилка з'єднання з API: {e}. Перевірте файл .streamlit/secrets.toml")
+
+if st.session_state.ai_response:
+        st.success(st.session_state.ai_response)
 
 
     
