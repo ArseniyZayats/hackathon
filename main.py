@@ -17,7 +17,7 @@ if current_dir not in sys.path:
 try:
     from parser import parse_bin 
     from CoreAnalytics.coreAnalytics import merge_data, compute_all_metrics
-    vis_module = importlib.import_module("3DVisual.3Dvisual")
+    vis_module = importlib.import_module("Visual.visual")
     generate_3d_model = getattr(vis_module, "generate_3d_model")
 except Exception as e:
     st.error(f"⚠️ Помилка імпорту модулів: {e}")
