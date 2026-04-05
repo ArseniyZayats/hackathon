@@ -61,120 +61,108 @@ def process_flight_data(file_path):
 # =============================================================================
 with st.sidebar:
     st.header("⚙️ Завантаження даних")
-    uploaded_file = st.file_uploader("Завантажте лог-файл (.BIN)", type=['bin'])
+    # ЗМІНА: Додаємо accept_multiple_files=True
+    uploaded_files = st.file_uploader("Завантажте лог-файли (.BIN)", type=['bin'], accept_multiple_files=True)
     
     st.divider()
-    st.info("💡 **Порада:** Цей дашборд автоматично розраховує кінематику, відображає напругу батареї та генерує 3D-анімацію місії.")
+    st.info("💡 Завантажте ДВА файли одночасно, щоб увімкнути режим порівняння!")
 
 # =============================================================================
 # 5. ГОЛОВНИЙ ІНТЕРФЕЙС
 # =============================================================================
-if uploaded_file is not None:
-    # Створюємо тимчасову ізольовану директорію для роботи 3D-рушія
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        
-        # Зберігаємо завантажений файл із його оригінальною назвою
-        temp_file_path = os.path.join(tmp_dir, uploaded_file.name)
-        with open(temp_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+if uploaded_files:
+    if len(uploaded_files) > 2:
+        st.warning("⚠️ Для коректного порівняння завантажте не більше 2-х файлів.")
+    else:
+        with tempfile.TemporaryDirectory() as tmp_dir:
             
-        with st.spinner("Аналіз лог-файлу, розрахунок метрик та генерація 3D-анімації..."):
-            try:
-                # --- ВИКЛИК АЛГОРИТМІВ ---
-                df, metrics, att_df, mode_df, curr_df = process_flight_data(temp_file_path)
-                
-                # Виклик 3D-моделі (передаємо папку, як цього вимагає рушій команди)
-                fig_3d = generate_3d_model(target_folder=tmp_dir)
-                
-                st.success(f"Файл {uploaded_file.name} успішно розпарсено та оброблено!")
-                
-                # --- БЛОК 1: МЕТРИКИ КІНЕМАТИКИ ---
-                st.subheader("📊 Підсумкові показники місії")
-                if metrics:
-                    num_cols = min(len(metrics), 4)
-                    cols = st.columns(max(num_cols, 1))
-                    for i, (key, value) in enumerate(metrics.items()):
-                        # Форматуємо значення залежно від типу
-                        val_str = f"{value:.2f}" if isinstance(value, float) else str(value)
-                        cols[i % num_cols].metric(label=str(key).replace("_", " ").title(), value=val_str)
-                else:
-                    st.warning("Алгоритм аналітики не повернув метрик.")
-                
-                st.divider()
-                
-                # --- БЛОК 2: ПРОСТОРОВА ТРАЄКТОРІЯ (2D + 3D) ---
-                st.subheader("🗺️ Просторова траєкторія")
-                tab_2d, tab_3d = st.tabs(["🗺️ 2D Карта (GPS WGS-84)", "🧊 3D Анімація польоту"])
-                
-                with tab_2d:
-                    if 'lat_deg' in df.columns and 'lon_deg' in df.columns and not df.empty:
-                        start_lat, start_lon = df['lat_deg'].iloc[0], df['lon_deg'].iloc[0]
-                        fig_map = go.Figure(go.Scattermapbox(
-                            lat=df['lat_deg'], lon=df['lon_deg'],
-                            mode='lines', line=dict(width=4, color='#ff0055'), name='Маршрут'
-                        ))
-                        fig_map.update_layout(
-                            mapbox_style="open-street-map",
-                            mapbox=dict(center=dict(lat=start_lat, lon=start_lon), zoom=15),
-                            margin=dict(l=0, r=0, b=0, t=0), height=500
-                        )
-                        st.plotly_chart(fig_map, use_container_width=True)
-                    else:
-                        st.error("GPS дані (lat_deg, lon_deg) відсутні у цьому файлі.")
+            # 1. Зберігаємо ВСІ завантажені файли у тимчасову папку
+            for f in uploaded_files:
+                path = os.path.join(tmp_dir, f.name)
+                with open(path, "wb") as out:
+                    out.write(f.getbuffer())
+            
+            with st.spinner("Аналіз місій та рендеринг..."):
+                try:
+                    # 2. Обробляємо кожен файл алгоритмами команди
+                    flights_data = []
+                    for f in uploaded_files:
+                        path = os.path.join(tmp_dir, f.name)
+                        df, metrics, att_df, mode_df, curr_df = process_flight_data(path)
+                        flights_data.append({
+                            "name": f.name, "df": df, "metrics": metrics, 
+                            "mode_df": mode_df, "curr_df": curr_df
+                        })
+                    
+                    # 3. Викликаємо 3D-модель (вона сама знайде всі файли в tmp_dir!)
+                    fig_3d = generate_3d_model(target_folder=tmp_dir)
+                    
+                    st.success("Дані успішно оброблено!")
+                    
+                    # --- БЛОК 1: МЕТРИКИ (ОДИН ФАЙЛ АБО ПОРІВНЯННЯ) ---
+                    if len(flights_data) == 1:
+                        st.subheader(f"📊 Показники місії: {flights_data[0]['name']}")
+                        m1 = flights_data[0]['metrics']
+                        cols = st.columns(4)
+                        for i, (k, v) in enumerate(m1.items()):
+                            cols[i % 4].metric(k.replace("_", " ").title(), f"{v:.2f}" if isinstance(v, float) else str(v))
+                    
+                    elif len(flights_data) == 2:
+                        st.subheader("⚖️ Порівняльний аналіз місій")
+                        m1 = flights_data[0]['metrics']
+                        m2 = flights_data[1]['metrics']
+                        name1, name2 = flights_data[0]['name'], flights_data[1]['name']
                         
-                with tab_3d:
+                        st.markdown(f"**Базовий:** `{name1}` | **Порівнюється з:** `{name2}`")
+                        
+                        cols = st.columns(4)
+                        # Виводимо метрики з автоматичним розрахунком різниці (delta)
+                        for i, key in enumerate(m1.keys()):
+                            if key in m2:
+                                val1, val2 = m1[key], m2[key]
+                                if isinstance(val1, (int, float)):
+                                    diff = val2 - val1 # Різниця (наскільки 2-й політ більший/менший за 1-й)
+                                    cols[i % 4].metric(
+                                        label=key.replace("_", " ").title(), 
+                                        value=f"{val2:.2f}", 
+                                        delta=f"{diff:.2f} (відносно {name1})",
+                                        delta_color="normal"
+                                    )
+                    st.divider()
+                    
+                    # --- БЛОК 2: 3D АНІМАЦІЯ ---
+                    st.subheader("🗺️ Просторова траєкторія")
                     if fig_3d:
                         st.plotly_chart(fig_3d, use_container_width=True)
+                        if len(flights_data) == 2:
+                            st.caption("✨ Натисніть кнопку Play під графіком, щоб побачити одночасну симуляцію двох польотів!")
                     else:
-                        st.error("Не вдалося згенерувати 3D-анімацію. Перевірте логіку у 3Dvisual.py")
-                
-                st.divider()
-                
-                # --- БЛОК 3: БАТАРЕЯ ТА РЕЖИМИ ---
-                col_bat, col_mode = st.columns([2, 1])
-                
-                with col_bat:
-                    st.subheader("🔋 Аналіз живлення (Напруга)")
-                    if not curr_df.empty and 'voltage' in curr_df.columns:
-                        st.line_chart(curr_df, x='timestamp', y='voltage', color="#ff4b4b")
-                    else:
-                        st.info("Датчик живлення не був підключений.")
+                        st.error("Не вдалося згенерувати 3D-анімацію.")
                         
-                with col_mode:
-                    st.subheader("🕹️ Режими польоту")
-                    if not mode_df.empty and 'mode_name' in mode_df.columns:
-                        st.dataframe(mode_df[['timestamp', 'mode_name']], use_container_width=True, hide_index=True)
-                    else:
-                        st.info("Дані про режими відсутні.")
-                
-                st.divider()
-                
-                # --- БЛОК 4: AI АСИСТЕНТ ---
-                st.subheader("🤖 AI Висновок")
-                if "ai_response" not in st.session_state:
-                    st.session_state.ai_response = None
+                    st.divider()
                     
-                if st.button("Згенерувати автоматичний звіт", type="primary"):
-                    with st.spinner("AI аналізує показники..."):
-                        try:
-                            genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-                            model = genai.GenerativeModel('gemini-2.5-flash')
-                              
-                            metrics_text = ", ".join([f"{k}: {v:.2f}" if isinstance(v, float) else f"{k}: {v}" for k, v in metrics.items()])
-                            prompt = f"Ти досвідчений інженер телеметрії БПЛА. Проаналізуй ці метрики: {metrics_text}. Напиши короткий технічний висновок українською мовою (3-4 речення). Вкажи на можливі аномалії."
+                    # --- БЛОК 3: AI АСИСТЕНТ (АДАПТОВАНИЙ ДЛЯ ПОРІВНЯННЯ) ---
+                    st.subheader("🤖 AI Аналітик")
+                    if st.button("Згенерувати автоматичний звіт", type="primary"):
+                        with st.spinner("AI працює..."):
+                            api_key = st.secrets.get("GEMINI_API_KEY", "")
+                            if not api_key:
+                                st.error("⚠️ API-ключ не знайдено.")
+                            else:
+                                genai.configure(api_key=api_key)
+                                model = genai.GenerativeModel('gemini-1.5-flash')
                                 
-                            response = model.generate_content(prompt)
-                            if response.text:
-                                st.session_state.ai_response = response.text
-                        except Exception as e:
-                            st.error(f"⚠️ Помилка AI: {e}")
-                            
-                if st.session_state.ai_response:
-                    st.success(st.session_state.ai_response)
+                                if len(flights_data) == 1:
+                                    prompt = f"Проаналізуй політ. Метрики: {flights_data[0]['metrics']}. Напиши висновок українською (3 речення)."
+                                else:
+                                    prompt = f"Ти інженер. Порівняй два польоти БПЛА. Політ 1: {flights_data[0]['metrics']}. Політ 2: {flights_data[1]['metrics']}. Напиши стислий висновок українською (4 речення): який був агресивнішим, ефективнішим тощо."
+                                
+                                try:
+                                    st.success(model.generate_content(prompt).text)
+                                except Exception as e:
+                                    st.error(f"Помилка AI: {e}")
 
-            except Exception as e:
-                st.error(f"🛑 Сталася критична помилка під час обробки: {e}")
-
+                except Exception as e:
+                    st.error(f"🛑 Сталася помилка обробки: {e}")
 else:
-    # Заглушка, коли файл ще не завантажено
-    st.info("👈 Будь ласка, завантажте лог-файл (наприклад `00000001.BIN`) у бічній панелі, щоб розпочати роботу.")
+    st.info("👈 Завантажте один або два лог-файли у бічній панелі.")
