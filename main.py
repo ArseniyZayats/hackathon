@@ -213,7 +213,7 @@ if uploaded_files:
                                 st.error("⚠️ API-ключ не знайдено.")
                             else:
                                 genai.configure(api_key=api_key)
-                                model = genai.GenerativeModel('gemini-1.5-flash')
+                                model = genai.GenerativeModel('gemini-2.5-flash')
                                 
                                 if len(flights_data) == 1:
                                     prompt = f"Проаналізуй політ БПЛА. Метрики: {flights_data[0]['metrics']}. Напиши висновок українською (3 речення)."
